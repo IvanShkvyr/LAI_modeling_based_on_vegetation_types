@@ -1,14 +1,18 @@
 import geopandas as gpd
 import numpy as np
+import os
 import pandas as pd
 from pathlib import Path
 import rasterio
 from rasterio.mask import mask
 from rasterio.warp import reproject, Resampling
 
-
 from file_processing import ensure_directory_exists
 
+
+GREEN = "\u001b[32m"
+CYAN = "\u001b[36m"
+RESET = "\033[0m"
 
 
 def clip_raster_by_shapefile(
@@ -88,7 +92,7 @@ def create_template_raster(
         filename (str): Name of the output template raster file to be created.
 
     Returns:
-        str: Path to the created template raster file.
+        Path: Path to the created template raster file.
 
     Notes:
         - This function reads the metadata (profile) from the base raster,
@@ -101,34 +105,38 @@ def create_template_raster(
     output_folder_path = ensure_directory_exists(output_folder)
 
     # Formulate the path to the output file
-    template_raster_path = output_folder_path / filename
+    template_raster_path = os.path.join(output_folder_path, filename)
 
-    # Open the base raster and read its profile
-    with rasterio.open(base_raster, "r") as src:
-        profile = src.profile
+    try:
+        # Open the base raster and read its profile
+        with rasterio.open(base_raster, "r") as src:
+            profile = src.profile
 
-        # Remove nodata parameter if it exists (not needed for an empty file)
-        profile.pop("nodata", None)
+            # Remove nodata parameter if it exists
+            profile.pop("nodata", None)
 
-        # Update profile for saving in GTiff format
-        profile.update(
-                      driver="GTiff",
-                      dtype=rasterio.float32,
-                      count=1,
-                      compress="lzw"
-                      )
+            # Update profile for saving in GTiff format
+            profile.update(
+                        driver="GTiff",
+                        dtype=rasterio.float32,
+                        count=1,
+                        compress="lzw"
+                        )
 
-        # Create a new TIFF file with all pixels set to 0
-        with rasterio.open(template_raster_path, "w", **profile) as dst:
-            # Create an array filled with zeros
-            zeros_array = np.zeros((src.height, src.width), dtype=np.float32)
+            # Create a new TIFF file with all pixels set to 0
+            with rasterio.open(template_raster_path, "w", **profile) as dst:
+                # Create an array filled with zeros
+                zeros_arr = np.zeros((src.height, src.width), dtype=np.float32)
 
-            # Write the zeros array to the output file
-            dst.write(zeros_array, 1)
+                # Write the zeros array to the output file
+                dst.write(zeros_arr, 1)
+    except Exception as err:
+        raise RuntimeError(f"An error occurred while creating the template\
+                             raster: {err}")
     return template_raster_path
 
 
-def copy_data_to_template(
+def copy_data_to_template( ## CNFHF AEYRWSZ
     template_raster: Path,
     source_file: Path,
     output_folder: str,
@@ -139,7 +147,7 @@ def copy_data_to_template(
     template_raster, and copies non-zero values to output_file.
 
     Parameters:
-        template_raster ( Path): Path to the template raster file used for the
+        template_raster (Path): Path to the template raster file used for the
           extent and resolution.
         source_file (Path): Path to the input raster file containing data to be
           resampled.
@@ -158,7 +166,7 @@ def copy_data_to_template(
     if filename is None:
         # Extract the base name without extension and add the suffix
         base_name = Path(source_file).stem
-        filename = f"{base_name}_unifited.tif"
+        filename = f"{base_name}.tif"
     else:
         # Ensure the filename has a .tif extension
         filename = f"{filename}.tif"
@@ -221,6 +229,7 @@ def copy_data_to_template(
 def read_raster(raster_path: Path) -> np.ndarray:
     """
     Reads the first band of a raster file and returns it as a numpy array.
+    If the raster contain a NODATA value, it will be replaced with NaN
 
     Parameters:
         raster_path (Path): The path to the raster file to be read.
@@ -229,11 +238,21 @@ def read_raster(raster_path: Path) -> np.ndarray:
         numpy.ndarray: The first band of the raster file as a 2D array.
     """
     with rasterio.open(raster_path) as src:
-        return src.read(1)
+        # Read the first band
+        data = src.read(1)
+
+        # Retrieve the NODATA value from the raster metadata
+        nodata_value = src.nodata
+
+        if nodata_value is not None:
+            # Replace NODATA values with NaN
+            data = np.where(data == nodata_value, np.nan, data)
+
+        return data
 
 
 def save_data_to_raster(
-    lai_adjusted: np.ndarray,
+    data: np.ndarray,
     reference_raster_path: str,
     output_path: str,
 ) -> None:
@@ -242,7 +261,7 @@ def save_data_to_raster(
     a reference raster.
 
     Parameters:
-        lai_adjusted (numpy.ndarray): Adjusted LAI data to be saved.
+        data (numpy.ndarray): Data to be saved.
         reference_raster_path (str): Path to the reference raster file, used to
           extract metadata. 
         output_path (str): Path where the new raster file will be saved.
@@ -258,65 +277,115 @@ def save_data_to_raster(
     with rasterio.open(reference_raster_path) as ref_raster:
         # Copy metadata from the reference raster
         meta = ref_raster.meta.copy()
+
+        # Update metadata for single-band and float32 output
+        meta.update(dtype="float32", count=1)
         
-        # Update metadata to match the data type of lai_adjusted (float32)
-        meta.update(dtype='float32', count=1)
-        
-        # Check if the dimensions of lai_adjusted match the reference raster
-        if lai_adjusted.shape != (meta['height'], meta['width']):
+        # Ensure the data dimensions match the reference raster's dimensions
+        if data.shape != (meta['height'], meta['width']):
             raise ValueError("The dimensions of lai_adjusted do not match the \
 reference raster dimensions.")
         
         # Write the adjusted LAI data to the new raster file
         with rasterio.open(output_path, 'w', **meta) as dst:
-            dst.write(lai_adjusted.astype('float32'), 1)
-
+            dst.write(data.astype("float32"), 1)
 
 
 def generate_lai_raster(
                         dataframe: pd.DataFrame,
-                        files_vegetation: str,
-                        results_folder: str
-                        ) -> None:
+                        files_vegetation_base: str,
+                        files_vegetation_predict: str,
+                        lai_rasters_folder: str,
+                        results_folder: str,
+                        predict_year: str,
+                        base_year : str,
+                        ) -> pd.DataFrame:
     """
-    Generates LAI raster images for each day of the year based on a given DataFrame and vegetation raster.
+    Generates a LAI raster for each day of the year based on the given
+    DataFrame and vegetation raster image.
 
     Parameters:
-    - dataframe (pd.DataFrame): DataFrame containing columns 'Date', 'Landuse', and 'Mean_LAI'.
-    - files_vegetation (str): Path to the raster file with land use classes.
-    - results_folder (str): Path to the folder where the resulting rasters will be saved.
+    - dataframe (pd.DataFrame): A DataFrame containing columns 'Date',
+      'Landuse', and 'Mean_LAI'.
+    - files_vegetation_base (str): Path to the base vegetation raster used to
+      create the 2020 raster image.
+    - files_vegetation_predict (str): Path to the predicted vegetation type
+      raster.
+    - lai_rasters_folder (str): Folder containing the LAI rasters.
+    - results_folder (str): Path to the folder where the resulting rasters will
+      be saved.
+    - predict_year (str): The year of the predicted vegetation raster.
+    - base_year (str): The base year for which the original vegetation raster
+      was created.
 
     Returns:
-    - None
+    - pd.DataFrame: A DataFrame containing the statistics of the new rasters
+      created.
     """
-    # Open the vegetation raster
-    with rasterio.open(files_vegetation) as src:
-        # Read the raster data
-        vegetation_data = src.read(1)
-        meta = src.meta.copy()
+    data = []
 
-        # Iterate over each unique day in the DataFrame
+    from data_processing import calculate_lai_statistic
+
+    # Open the base vegetation raster
+    with rasterio.open(files_vegetation_base) as base_src:
+        base_data = base_src.read(1)
+
+    # Create a mask based on the base vegetation raster (non-zero values)
+    mask = (base_data != 0)
+
+    # Open the predicted vegetation raster
+    with rasterio.open(files_vegetation_predict) as predict_src:
+        predict_data = predict_src.read(1)
+        meta = predict_src.meta.copy()
+
+        # Iterate through each unique day in the DataFrame
         for day in dataframe["Date"].unique():
-            # Filter DataFrame for the specific day
+            # Filter the DataFrame for the current day
             day_data = dataframe[dataframe["Date"] == day]
 
-            # Create a mapping of land use class to Mean_LAI
-            class_to_lai = dict(zip(day_data["Landuse"], day_data["Mean"]))
+            # Convert day to the day of the year
+            day_of_year = pd.Timestamp(day).dayofyear
 
-            # Replace class codes in the raster with the corresponding LAI values
-            lai_data = vegetation_data.copy()
-            for landuse_class, lai_value in class_to_lai.items():
-                lai_data[vegetation_data == landuse_class] = lai_value
 
-            # Update metadata for output raster
+            # Load the LAI raster for the specific day
+            lai_raster_path = (
+            Path(lai_rasters_folder) / f"lai_{base_year}{day_of_year:03d}.tif"
+                )
+
+            with rasterio.open(lai_raster_path) as lai_src:
+                lai_data = lai_src.read(1)
+
+            # Create a mapping of land use classes to the mean LAI value
+            class_lai_mean = dict(zip(day_data["Landuse"], day_data["Mean"]))
+
+            # Generate a new LAI raster
+            new_lai_data = base_data.copy()
+            for i in range(base_data.shape[0]):
+                for j in range(base_data.shape[1]):
+                    base_class = base_data[i, j]
+                    predict_class = predict_data[i, j]
+                    if base_class == predict_class:
+                        new_lai_data[i, j] = lai_data[i, j]
+                    else:
+                        lai_value = lai_data[i, j]
+                        mean_base_class = class_lai_mean.get(base_class, 1)
+                        mean_predict_class = (
+                            class_lai_mean.get(predict_class, 1)
+                            )
+                        new_lai_data[i, j] = (
+                            lai_value * (mean_predict_class / mean_base_class)
+                            )
+
+            # Update the metadata for the resulting raster
             meta.update(dtype=rasterio.float32)
 
-            # Define output file path
-            output_filename = Path(results_folder) / f"{Path(files_vegetation).stem}_{int(day):03d}.tif"
+            # Define the path for the resulting file
+            output_filename = (
+            Path(results_folder) / f"LAI_{predict_year}{day_of_year:03d}.tif"
+            )
 
-
-            # Write the new raster
+            # Write the new LAI raster
             with rasterio.open(output_filename, "w", **meta) as dst:
-                dst.write(lai_data.astype(rasterio.float32), 1)
-
-    print(f"LAI rasters have been saved to: {results_folder}")
+                dst.write(new_lai_data.astype(rasterio.float32), 1)
+   
+    print(f"Растри LAI збережено в: {results_folder}")
